@@ -1,0 +1,336 @@
+# agent_rules.yaml
+# Agent-executable rules for implementing the LLM-based auto-build + component evolution system.
+# This file rewrites the design goals/constraints into operational rules for a coding agent.
+
+ruleset:
+  name: llm_auto_build_system_rules
+  version: 0.1
+  language: zh-CN
+  default_enforcement: hard
+
+  # Rule slicing controls prompt/context size: only inject rules that match the current component/task.
+  slicing:
+    always_include_rule_ids:
+      - R-GLOBAL-001
+      - R-GLOBAL-002
+      - R-GLOBAL-003
+      - R-BUILD-001
+      - R-TEST-001
+    match_keys:
+      # These keys are expected to be derivable from the component descriptor / manifest.
+      - component.type
+      - ports.provides[*].kind
+      - ports.requires[*].kind
+      - interactions[*].mode
+      - resources[*].kind
+      - change.kind
+      - failure.kind
+    max_rules_in_context:
+      soft_limit: 20
+      hard_limit: 40
+
+  conventions:
+    artifacts_dir: artifacts
+    component_manifest:
+      path: artifacts/component_manifest.yaml
+      required_fields:
+        - component.name
+        - component.version
+        - ports.provides
+        - ports.requires
+        - interactions
+    reports:
+      change_report: artifacts/change_report.md
+      build_report: artifacts/build_report.md
+      test_report: artifacts/test_report.md
+      repair_plan: artifacts/repair_plan.md
+
+
+# A rule is considered "agent-executable" if it has: triggers, scope, required actions, validations, and violation handling.
+# Enforcement:
+# - hard: MUST follow. Violations block merge/advance.
+# - soft: SHOULD follow. Violations require explicit rationale in the change report.
+
+rules:
+
+  # -------------------------
+  # Global / Context
+  # -------------------------
+
+  - id: R-GLOBAL-001
+    title: 规则切片注入（控制上下文规模）
+    enforcement: hard
+    scope: agent_prompt
+    triggers: [on_generate, on_modify, on_upgrade, on_fix]
+    actions:
+      - Determine the target component and task.
+      - Load ONLY:
+          (a) always-include rules,
+          (b) rules whose match criteria fit the target component (port kinds / interaction modes),
+          (c) rules whose match criteria fit the current failure kind (if any).
+      - Exclude unrelated rules to prevent oversized context.
+    validations:
+      - Record selected rule ids in an artifact named: artifacts/rules_used.json
+      - Ensure rules_used.json count <= ruleset.slicing.max_rules_in_context.hard_limit
+    on_violation:
+      - Stop and reduce injected rules; re-run with a smaller rule slice.
+
+  - id: R-GLOBAL-002
+    title: 单组件边界（默认不跨组件修改）
+    enforcement: hard
+    scope: code_change
+    triggers: [on_generate, on_modify, on_upgrade, on_fix]
+    actions:
+      - Treat "one component" as the default change boundary.
+      - If any file outside the target component boundary must change, you MUST create a repair/upgrade plan and justify each external change.
+    validations:
+      - Diff review: list all modified files in artifacts/change_report.md
+      - If modified files cross boundaries, artifacts/repair_plan.md MUST exist and enumerate them.
+    on_violation:
+      - Revert cross-boundary changes OR produce repair_plan.md and constrain changes accordingly.
+
+  - id: R-GLOBAL-003
+    title: 依赖信息显式化（不依赖隐式推断）
+    enforcement: hard
+    scope: architecture_model
+    triggers: [on_generate, on_modify, on_upgrade, on_fix]
+    actions:
+      - Use ONLY explicitly declared dependencies (ports/resources) to reason about upstream/downstream.
+      - Do not assume hidden couplings; if needed, add explicit declarations.
+    validations:
+      - Target component descriptor/manifest MUST list provides/requires and relevant interaction modes.
+    on_violation:
+      - Update the descriptor/manifest; do not proceed with hidden dependencies.
+
+
+  # -------------------------
+  # Interface / Relations modeling
+  # -------------------------
+
+  - id: R-REL-001
+    title: 关系必须可描述（每个组件必须产出/更新接口与关系描述）
+    enforcement: hard
+    scope: artifacts
+    triggers: [on_generate, on_modify, on_upgrade]
+    actions:
+      - For every component change, create or update its interface/relation descriptor (manifest).
+      - The descriptor MUST include provides/requires and the interaction kinds used.
+    validations:
+      - artifacts/component_manifest.yaml (or equivalent) MUST exist and be updated when ports change.
+    on_violation:
+      - Block until the descriptor is updated.
+
+  - id: R-REL-002
+    title: 交互模式必须落在统一抽象内（禁止绕开抽象制造隐式耦合）
+    enforcement: hard
+    scope: code_change
+    triggers: [on_generate, on_modify, on_upgrade]
+    match:
+      any:
+        - ports.provides[*].kind
+        - ports.requires[*].kind
+        - interactions[*].mode
+    actions:
+      - Implement inter-component communication ONLY via supported interaction abstractions declared in the descriptor.
+      - Do not introduce ad-hoc channels that are not declared (e.g., hidden HTTP calls, hidden shared files, hidden DB reads).
+    validations:
+      - For any new inter-component communication path, ensure a matching declaration exists in the descriptor.
+    on_violation:
+      - Remove the hidden coupling OR declare it explicitly and align with supported abstractions.
+
+  - id: R-TYPE-001
+    title: 类型变化必须显式（不兼容变化必须触发编译期失败或进入显式升级路径）
+    enforcement: hard
+    scope: evolution
+    triggers: [on_upgrade, on_modify]
+    actions:
+      - If interface type changes, update the descriptor with the new type information.
+      - If the change is incompatible, do NOT mask it at runtime.
+      - Let the build/type check fail or move into an explicit upgrade flow.
+    validations:
+      - artifacts/change_report.md MUST state whether interface/type changed.
+      - If changed: descriptor version/type info updated.
+    on_violation:
+      - Revert masking changes; restore explicit type gating.
+
+
+  # -------------------------
+  # Build / Failure semantics
+  # -------------------------
+
+  - id: R-BUILD-001
+    title: 编译期可检查（关键不一致不得推迟到运行期）
+    enforcement: hard
+    scope: pipeline
+    triggers: [on_generate, on_modify, on_upgrade, on_fix]
+    actions:
+      - Run compile/build/type checks appropriate for the component/system.
+      - Ensure interface/relation constraints are checked at build time.
+    validations:
+      - artifacts/build_report.md MUST include the invoked build/typecheck commands and their results.
+    on_violation:
+      - Add missing build/typecheck steps; do not proceed without compile-time checking.
+
+  - id: R-BUILD-002
+    title: 失败即信号（禁止通过放宽类型/删约束/禁用检查来让构建通过）
+    enforcement: hard
+    scope: pipeline
+    triggers: [on_build_fail, on_typecheck_fail]
+    actions:
+      - Do NOT disable checks, remove constraints, or weaken types solely to pass builds.
+      - Preserve failures as evolution-control signals.
+    validations:
+      - change_report.md MUST explicitly list any relaxed/disabled checks (should be none).
+    on_violation:
+      - Revert the relaxing changes; re-handle the failure via a controlled repair plan.
+
+  - id: R-BUILD-003
+    title: 失败后的动作受控（必须产出修复方案或执行受限升级/适配）
+    enforcement: hard
+    scope: evolution
+    triggers: [on_build_fail, on_typecheck_fail, on_test_fail]
+    actions:
+      - Produce artifacts/repair_plan.md containing:
+          (a) the failure summary,
+          (b) affected components/ports,
+          (c) options - user-choice path and/or auto-upgrade path,
+          (d) the bounded set of files/components allowed to change,
+          (e) the minimal test set to re-run.
+      - Apply fixes strictly within the plan boundary.
+    validations:
+      - repair_plan.md exists when there is a failure.
+      - change_report.md references the plan and shows boundary compliance.
+    on_violation:
+      - Stop and rewrite the change as a plan-bounded repair.
+
+
+  # -------------------------
+  # Testing / Quality gates
+  # -------------------------
+
+  - id: R-TEST-001
+    title: 组件可单测（隔离测试必须可行）
+    enforcement: hard
+    scope: testing
+    triggers: [on_generate, on_modify, on_upgrade]
+    actions:
+      - Ensure the component can be tested in isolation.
+      - Add/update tests so the component's key behavior does not depend on uncontrolled external environment.
+    validations:
+      - artifacts/test_report.md MUST list executed unit tests and results.
+    on_violation:
+      - Add missing isolation seams/mocks and unit tests; re-run.
+
+  - id: R-TEST-002
+    title: 系统可集测（组合后仍可测试）
+    enforcement: hard
+    scope: testing
+    triggers: [on_modify, on_upgrade]
+    actions:
+      - Ensure changes do not break system-level integration testability.
+      - Provide or update integration tests for critical paths impacted by the change.
+    validations:
+      - test_report.md MUST list executed integration tests when dependencies/ports are impacted.
+    on_violation:
+      - Add/update integration tests; do not proceed without coverage of impacted paths.
+
+  - id: R-TEST-003
+    title: 测试驱动验收（通过测试是主要验收依据）
+    enforcement: hard
+    scope: pipeline
+    triggers: [on_generate, on_modify, on_upgrade, on_fix]
+    actions:
+      - Use tests as the primary acceptance criterion.
+      - Do not rely on manual review alone.
+    validations:
+      - build_report.md and test_report.md both exist and indicate pass/fail.
+    on_violation:
+      - Add missing tests or fix failing tests before advancing.
+
+  - id: R-TEST-004
+    title: 高并发迭代验证（阶段内进行高频编译-测试循环）
+    enforcement: soft
+    scope: process
+    triggers: [on_generate, on_modify, on_upgrade, on_fix]
+    actions:
+      - Within a stage, iterate: generate/change -> build/typecheck -> test -> fix until pass.
+      - Prefer smaller diffs and faster feedback.
+    validations:
+      - change_report.md SHOULD summarize iteration count and key failures fixed.
+    on_violation:
+      - Add a short rationale in change_report.md.
+
+
+  # -------------------------
+  # Evolution / Traceability
+  # -------------------------
+
+  - id: R-EVOL-001
+    title: 升级可追踪（接口类型与关系描述版本化）
+    enforcement: hard
+    scope: evolution
+    triggers: [on_upgrade]
+    actions:
+      - Record the interface/type change and version change in the descriptor.
+      - Ensure the change is traceable and rollback-able.
+    validations:
+      - change_report.md MUST include old/new versions and impacted ports.
+    on_violation:
+      - Block until traceability info is present.
+
+  - id: R-EVOL-002
+    title: 自动升级保持可维护（遵守关系抽象、类型约束、测试门槛）
+    enforcement: hard
+    scope: evolution
+    triggers: [on_auto_upgrade]
+    actions:
+      - When performing auto-upgrade, do not introduce implicit couplings.
+      - Preserve compile-time checks and test gates.
+    validations:
+      - build_report.md + test_report.md MUST both pass after auto-upgrade.
+    on_violation:
+      - Revert and re-approach within constraints; do not ship a brittle workaround.
+
+  - id: R-EVOL-003
+    title: 局部收敛优先（先保证单组件类型正确与测试通过）
+    enforcement: hard
+    scope: planning
+    triggers: [on_generate, on_modify, on_upgrade, on_fix]
+    actions:
+      - Prioritize making the target component pass its type checks and unit tests before expanding changes.
+      - Expand scope only when required by repair_plan.md.
+    validations:
+      - repair_plan.md boundary honored; unit tests for the target component pass.
+    on_violation:
+      - Reduce scope; fix locally first.
+
+
+  # -------------------------
+  # Security / Vulnerability awareness
+  # -------------------------
+
+  - id: R-SEC-001
+    title: 漏洞信息纳入生成与升级（避免引入已知高风险依赖）
+    enforcement: soft
+    scope: dependencies
+    triggers: [on_generate, on_modify, on_upgrade, on_dependency_change]
+    actions:
+      - When adding/upgrading dependencies, consult vulnerability information (e.g., CVE sources) and avoid known high-risk versions.
+      - If a vulnerable dependency must be used temporarily, record the rationale and follow-up action.
+    validations:
+      - change_report.md SHOULD list dependency changes and note vulnerability consideration.
+    on_violation:
+      - Add rationale in change_report.md and propose an upgrade/remediation path.
+
+  - id: R-SEC-002
+    title: 安全不降低门槛（处理漏洞也必须遵守类型与测试约束）
+    enforcement: hard
+    scope: pipeline
+    triggers: [on_dependency_upgrade_for_security]
+    actions:
+      - Do not bypass type checks or tests to apply security fixes.
+      - Apply the same compile-time and test gates.
+    validations:
+      - build_report.md + test_report.md pass.
+    on_violation:
+      - Revert bypass; implement a compliant security fix.
